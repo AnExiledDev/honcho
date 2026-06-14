@@ -351,10 +351,18 @@ async def _query_documents_pgvector(
     """pgvector similarity search — pure DB operation.
 
     When *hybrid* is True and a non-empty *query* is supplied, the cosine
-    ranking is fused (Reciprocal Rank Fusion) with an on-the-fly full-text
-    ranking over the same scoped candidate pool, so exact-term/identifier
-    matches (issue numbers, project names) that pure cosine misses are
-    surfaced. *max_distance* gates only the vector arm — lexical matches are a
+    ranking is fused (Reciprocal Rank Fusion) with three more arms over the
+    same relevance-filtered candidate pool:
+      * full-text (ts_rank) — surfaces exact-term/identifier matches (issue
+        numbers, project names) that pure cosine misses;
+      * recency (created_at desc) — favors fresher facts;
+      * reinforcement (times_derived desc) — favors repeatedly-derived facts.
+    RRF combines them with no weight tuning, and because the recency/
+    reinforcement arms rank only the existing relevance pool they reorder
+    without introducing irrelevant docs or dropping any (no retrieval-time
+    dedup — write-time dedup at >=0.95 already prevents near-identical
+    storage, and a looser retrieval threshold would risk discarding distinct
+    nuances). *max_distance* gates only the vector arm — lexical matches are a
     separate relevance axis (the dedup path keeps hybrid off, preserving its
     strict cosine cutoff).
     """
@@ -389,11 +397,30 @@ async def _query_documents_pgvector(
         db, base_stmt, cast(str, query), candidate_limit
     )
 
+    # Recency / reinforcement arms re-rank ONLY the relevance pool (vector U
+    # full-text), so they reorder without adding irrelevant docs. Dedup by
+    # object identity first — the same row can appear in both relevance arms
+    # (SQLAlchemy's identity map returns one instance), and an arm must not
+    # list a doc twice.
+    candidate_pool = list(
+        {id(d): d for d in (*vector_results, *fulltext_results)}.values()
+    )
+    recency_arm = sorted(candidate_pool, key=lambda d: d.created_at, reverse=True)
+    reinforcement_arm = sorted(
+        candidate_pool, key=lambda d: d.times_derived, reverse=True
+    )
+
     # Same session -> SQLAlchemy's identity map returns the same Document
-    # instance for a row in both arms, so RRF fuses correctly on object identity.
+    # instance for a row across arms, so RRF fuses correctly on object identity.
     from src.utils.search import reciprocal_rank_fusion
 
-    return reciprocal_rank_fusion(vector_results, fulltext_results, limit=top_k)
+    return reciprocal_rank_fusion(
+        vector_results,
+        fulltext_results,
+        recency_arm,
+        reinforcement_arm,
+        limit=top_k,
+    )
 
 
 async def query_documents(

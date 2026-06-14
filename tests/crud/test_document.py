@@ -479,3 +479,63 @@ class TestDocumentCRUD:
             "hybrid retrieval must surface the exact-term match that cosine dropped"
         )
         assert hybrid[0].content == content_far
+
+    @pytest.mark.asyncio
+    async def test_hybrid_weights_recency_and_reinforcement(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """With relevance held equal (identical embeddings, no term match), the
+        fresher and more-reinforced conclusion ranks first — recency and
+        times_derived act as RRF arms."""
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+
+        emb = [0.0] * 1536
+        emb[0] = 1.0  # both docs share this direction -> equal cosine
+
+        old_at = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        new_at = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+
+        doc_stale = models.Document(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+            content="alpha note about onboarding",
+            embedding=list(emb),
+            session_name=test_session.name,
+            times_derived=1,
+            created_at=old_at,
+        )
+        doc_strong = models.Document(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+            content="beta note about onboarding",
+            embedding=list(emb),
+            session_name=test_session.name,
+            times_derived=10,  # reinforced
+            created_at=new_at,  # and fresher
+        )
+        db_session.add_all([doc_stale, doc_strong])
+        await db_session.flush()
+
+        results = await crud.query_documents(
+            db_session,
+            workspace_name=test_workspace.name,
+            query="gamma zeta",  # matches neither content -> no full-text arm
+            observer=test_peer.name,
+            observed=test_peer2.name,
+            top_k=2,
+            embedding=list(emb),
+            hybrid=True,
+        )
+
+        contents = [d.content for d in results]
+        assert set(contents) == {doc_stale.content, doc_strong.content}
+        assert results[0].content == doc_strong.content, (
+            "the fresher, more-reinforced conclusion must rank first when relevance ties"
+        )
