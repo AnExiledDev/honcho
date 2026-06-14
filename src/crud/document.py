@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from logging import getLogger
 from typing import Any, cast
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -297,36 +297,28 @@ async def _fulltext_documents(
     """Lexically rank documents for *query* over an already-scoped base
     statement (workspace/observer/observed/filters/deleted_at applied).
 
-    Mirrors the message FTS path: ``plainto_tsquery`` ranked by ``ts_rank`` for
-    natural-language queries, with an ILIKE fallback for queries containing
-    special characters (and as an OR fallback otherwise). Reads the STORED,
-    GIN-indexed ``content_tsv`` column (R2) instead of recomputing
-    ``to_tsvector(content)`` per row — the recompute dominated FTS latency
-    (~286ms over a ~4.7k-row collection); the stored vector makes it single-
-    digit ms and the GIN index keeps it bounded as the corpus grows.
+    Natural-language queries: ``plainto_tsquery`` matched by ``@@`` and ranked
+    by ``ts_rank``. The match expression is ``to_tsvector('english', content)``
+    so the GIN expression index ``ix_documents_content_tsv_expr`` (R2) is used
+    instead of recomputing ``to_tsvector`` over the whole (observer,observed)
+    collection per query (measured ~308ms over ~4.7k rows -> ~0.2ms). Queries
+    with special characters (identifiers, paths) keep the substring ILIKE path,
+    since ``plainto_tsquery`` would mangle them. Substring recall that pure FTS
+    misses on natural-language queries is covered by the hybrid vector arm — an
+    OR'd ILIKE here would defeat the index, so it is intentionally not used.
     """
-    escaped_query = escape_ilike_pattern(query)
-
     if _FTS_SPECIAL_CHARS_RE.search(query):
+        escaped_query = escape_ilike_pattern(query)
         fulltext_query = base_stmt.where(
             models.Document.content.ilike(
                 f"%{escaped_query}%", escape=ILIKE_ESCAPE_CHAR
             )
         ).order_by(models.Document.created_at.desc())
     else:
+        tsv = func.to_tsvector("english", models.Document.content)
         tsquery = func.plainto_tsquery("english", query)
-        fts_condition = models.Document.content_tsv.op("@@")(tsquery)
-        combined_condition = or_(
-            fts_condition,
-            models.Document.content.ilike(
-                f"%{escaped_query}%", escape=ILIKE_ESCAPE_CHAR
-            ),
-        )
-        fulltext_query = base_stmt.where(combined_condition).order_by(
-            func.coalesce(
-                func.ts_rank(models.Document.content_tsv, tsquery),
-                0,
-            ).desc(),
+        fulltext_query = base_stmt.where(tsv.op("@@")(tsquery)).order_by(
+            func.ts_rank(tsv, tsquery).desc(),
             models.Document.created_at.desc(),
         )
 

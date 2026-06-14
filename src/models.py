@@ -10,7 +10,6 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
-    Computed,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -21,7 +20,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TEXT, TSVECTOR
+from sqlalchemy.dialects.postgresql import JSONB, TEXT
 from sqlalchemy.orm import Mapped, MappedColumn, mapped_column, relationship
 from sqlalchemy.sql import func
 from typing_extensions import override
@@ -384,16 +383,6 @@ class Document(Base):
         "internal_metadata", JSONB, default=dict, server_default=text("'{}'::jsonb")
     )
     content: Mapped[str] = mapped_column(TEXT)
-    # R2: STORED generated full-text vector + GIN index (see __table_args__).
-    # Eliminates per-query to_tsvector(content) recomputation on the FTS arm
-    # (measured ~286ms over a ~4.7k-row collection -> single-digit ms).
-    # deferred: used only in SQL WHERE/ORDER BY, never loaded onto the object.
-    content_tsv: Mapped[Any] = mapped_column(
-        TSVECTOR,
-        Computed("to_tsvector('english', content)", persisted=True),
-        nullable=True,
-        deferred=True,
-    )
     level: Mapped[DocumentLevel] = mapped_column(
         TEXT, nullable=False, server_default="explicit"
     )
@@ -475,10 +464,14 @@ class Document(Base):
             "source_ids",
             postgresql_using="gin",
         ),
-        # R2: GIN index on the stored full-text vector for the hybrid FTS arm.
+        # R2: GIN expression index on to_tsvector(content) for the hybrid FTS
+        # arm. Lets the FTS @@ match use the index instead of recomputing
+        # to_tsvector over the whole (observer,observed) collection per query
+        # (measured ~308ms over ~4.7k rows -> ~0.2ms). The 2-arg to_tsvector
+        # form is IMMUTABLE, required for an expression index.
         Index(
-            "ix_documents_content_tsv",
-            "content_tsv",
+            "ix_documents_content_tsv_expr",
+            text("to_tsvector('english', content)"),
             postgresql_using="gin",
         ),
         # Composite index for efficient reconciliation queries

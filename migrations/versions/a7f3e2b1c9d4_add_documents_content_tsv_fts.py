@@ -1,8 +1,13 @@
-"""add stored content_tsv + GIN index to documents (R2 hybrid FTS arm)
+"""add GIN expression index on to_tsvector(content) (R2 hybrid FTS arm)
 
-Replaces per-query to_tsvector(content) recomputation on the conclusion
-full-text-search arm with a STORED generated tsvector column + GIN index.
-Measured: ~286ms FTS over a ~4.7k-row collection -> single-digit ms.
+Lets the conclusion full-text-search arm's ``@@`` match use a GIN index
+instead of recomputing ``to_tsvector(content)`` over the whole
+(observer,observed) collection on every query.
+Measured on the live hot collection (~4.7k rows): ~308ms -> ~0.2ms.
+
+Built CONCURRENTLY (outside the migration transaction) so it never takes an
+exclusive lock on the live documents table — an earlier STORED generated-column
+approach forced a full table rewrite under AccessExclusiveLock and was reverted.
 
 Revision ID: a7f3e2b1c9d4
 Revises: e4eba9cfaa6f
@@ -26,29 +31,23 @@ schema = settings.DB.SCHEMA
 
 
 def upgrade() -> None:
-    # STORED generated column. The 2-arg to_tsvector(regconfig, text) form is
-    # IMMUTABLE, which a generated column requires.
-    op.execute(
-        text(
-            f"""
-            ALTER TABLE {schema}.documents
-            ADD COLUMN IF NOT EXISTS content_tsv tsvector
-            GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
-            """
+    # CONCURRENTLY cannot run inside a transaction block; autocommit_block lets
+    # alembic step out of its per-migration transaction for this statement.
+    with op.get_context().autocommit_block():
+        op.execute(
+            text(
+                f"""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_documents_content_tsv_expr
+                ON {schema}.documents USING gin (to_tsvector('english', content));
+                """
+            )
         )
-    )
-    op.execute(
-        text(
-            f"""
-            CREATE INDEX IF NOT EXISTS ix_documents_content_tsv
-            ON {schema}.documents USING gin (content_tsv);
-            """
-        )
-    )
 
 
 def downgrade() -> None:
-    op.execute(text(f"DROP INDEX IF EXISTS {schema}.ix_documents_content_tsv;"))
-    op.execute(
-        text(f"ALTER TABLE {schema}.documents DROP COLUMN IF EXISTS content_tsv;")
-    )
+    with op.get_context().autocommit_block():
+        op.execute(
+            text(
+                f"DROP INDEX CONCURRENTLY IF EXISTS {schema}.ix_documents_content_tsv_expr;"
+            )
+        )
