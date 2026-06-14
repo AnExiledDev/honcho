@@ -120,9 +120,9 @@ class TestEnqueueFunction:
         # When deriver is disabled, only summary records should be created (if applicable)
         # Since this is message 1, and 1 % 20 != 0 and 1 % 60 != 0, no summary should be created
         # No representation records should be created either (deriver disabled)
-        assert (
-            final_count == initial_count
-        ), f"Expected no queue items, but got {final_count - initial_count}"
+        assert final_count == initial_count, (
+            f"Expected no queue items, but got {final_count - initial_count}"
+        )
 
     @pytest.mark.asyncio
     async def test_session_normal_processing_single_peer(
@@ -853,9 +853,9 @@ class TestGetEffectiveObserveMeFunction:
                 observed = f"sender_{i}"
 
             result = get_effective_observe_me(observed, peers_with_configuration)
-            assert (
-                result == expected
-            ), f"Test case {i} failed: peer_config={peer_config}, session_config={session_config}, expected={expected}, got={result}"
+            assert result == expected, (
+                f"Test case {i} failed: peer_config={peer_config}, session_config={session_config}, expected={expected}, got={result}"
+            )
 
 
 @pytest.mark.asyncio
@@ -1299,3 +1299,101 @@ class TestGenerateQueueRecordsSeqInSession:
             for record in summary_records:
                 # Should use the value from CRUD fallback (60)
                 assert record["payload"]["message_seq_in_session"] == 60
+
+
+@pytest.mark.asyncio
+class TestGenerateQueueRecordsNoiseFilter:
+    """generate_queue_records skips the representation task for wholly
+    operational-noise messages (DERIVER_FILTER_OPERATIONAL_NOISE), without
+    disturbing substantive messages or the summary path."""
+
+    @staticmethod
+    def _resolved_config() -> "schemas.ResolvedConfiguration":
+        # reasoning on, summary OFF so the only record in play is representation
+        return schemas.ResolvedConfiguration(
+            reasoning=schemas.ResolvedReasoningConfiguration(enabled=True),
+            summary=schemas.ResolvedSummaryConfiguration(
+                enabled=False,
+                messages_per_short_summary=20,
+                messages_per_long_summary=60,
+            ),
+            peer_card=schemas.ResolvedPeerCardConfiguration(use=True, create=True),
+            dream=schemas.ResolvedDreamConfiguration(enabled=True),
+        )
+
+    def _payload(
+        self, workspace_name: str, session_name: str, peer_name: str, content: str
+    ) -> dict[str, Any]:
+        return {
+            "message_id": 4242,
+            "peer_name": peer_name,
+            "workspace_name": workspace_name,
+            "session_name": session_name,
+            "content": content,
+            "seq_in_session": 7,  # not a summary multiple; summary is disabled anyway
+            "created_at": datetime.now(timezone.utc),
+        }
+
+    async def _run(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[Workspace, Peer],
+        content: str,
+    ) -> list[dict[str, Any]]:
+        test_workspace, test_peer = sample_data
+        test_session = models.Session(
+            workspace_name=test_workspace.name, name=str(generate_nanoid())
+        )
+        db_session.add(test_session)
+        await db_session.commit()
+
+        peers_config: dict[str, list[Any]] = {
+            test_peer.name: [{"observe_me": True}, {"observe_others": True}]
+        }
+        # seq_in_session is supplied, so the function never touches the db.
+        return await generate_queue_records(
+            db_session=AsyncMock(),
+            message=self._payload(
+                test_workspace.name, test_session.name, test_peer.name, content
+            ),
+            peers_with_configuration=peers_config,
+            session_id=test_session.id,
+            conf=self._resolved_config(),
+        )
+
+    async def test_operational_noise_skips_representation(
+        self, db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
+    ):
+        records = await self._run(
+            db_session, sample_data, "[Tool] read /opt/foundry/data/world.json"
+        )
+        rep = [r for r in records if r["task_type"] == "representation"]
+        assert rep == [], (
+            "operational-noise message must not create a representation record"
+        )
+
+    async def test_substantive_message_creates_representation(
+        self, db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
+    ):
+        records = await self._run(
+            db_session,
+            sample_data,
+            "Mendorik was rebuilt as a Beast of the Sky for Elerrina.",
+        )
+        rep = [r for r in records if r["task_type"] == "representation"]
+        assert len(rep) == 1, (
+            "substantive message must create exactly one representation record"
+        )
+
+    async def test_filter_disabled_keeps_representation(
+        self, db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
+    ):
+        # With the toggle off, even a noise message is derived (reversibility).
+        with patch(
+            "src.deriver.enqueue.settings.DERIVER.FILTER_OPERATIONAL_NOISE", new=False
+        ):
+            records = await self._run(
+                db_session, sample_data, "[Tool] read /opt/foundry/data/world.json"
+            )
+        rep = [r for r in records if r["task_type"] == "representation"]
+        assert len(rep) == 1, "with the filter disabled, noise must still be derived"

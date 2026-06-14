@@ -811,6 +811,13 @@ class DeriverSettings(HonchoSettings):
     # When enabled, bypasses the batch token threshold and processes work immediately
     FLUSH_ENABLED: bool = False
 
+    # When enabled, skip the representation (conclusion-deriving) task for
+    # messages whose content is wholly operational noise — harness/tool/git
+    # breadcrumbs, bare tool-use/task IDs, empty bodies, and control
+    # handshakes. Cuts junk conclusions and deriver token spend. Summaries are
+    # unaffected. See src.utils.noise_filter.is_operational_noise.
+    FILTER_OPERATIONAL_NOISE: bool = True
+
     @model_validator(mode="before")
     @classmethod
     def _merge_model_config_defaults(cls, data: Any) -> Any:

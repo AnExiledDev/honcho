@@ -12,6 +12,7 @@ from src.exceptions import ValidationException
 from src.models import QueueItem
 from src.schemas import MessageConfiguration, ResolvedConfiguration
 from src.utils.config_helpers import get_configuration
+from src.utils.noise_filter import is_operational_noise
 from src.utils.queue_payload import (
     create_deletion_payload,
     create_dream_payload,
@@ -369,8 +370,16 @@ async def generate_queue_records(
 
             observers.append(peer_name)
 
+    # Skip deriving conclusions from wholly-operational-noise messages
+    # (harness/tool/git breadcrumbs, bare IDs, control handshakes). This cuts
+    # junk representation facts and deriver token spend; summaries above are
+    # intentionally unaffected so the summary cadence is preserved.
+    suppress_representation = settings.DERIVER.FILTER_OPERATIONAL_NOISE and (
+        is_operational_noise(message.get("content"))
+    )
+
     # Create a single record with all observers (if any)
-    if observers:
+    if observers and not suppress_representation:
         records.append(
             create_representation_record(
                 message,
@@ -379,6 +388,12 @@ async def generate_queue_records(
                 observers=observers,
                 session_id=session_id,
             )
+        )
+    elif observers and suppress_representation:
+        logger.debug(
+            "Skipping representation for operational-noise message %s from %s",
+            message_id,
+            observed,
         )
 
     logger.debug(
