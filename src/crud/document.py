@@ -1193,6 +1193,12 @@ async def is_rejected_duplicate(
 
     # If new document has more or equal information, keep it and delete existing
     if score_new >= score_existing:
+        # Reinforcement (R1): this fact was derived again. Carry the running
+        # derivation count onto the surviving (new) doc so importance accrues
+        # across re-derivations instead of resetting to 1 each time.
+        doc.times_derived = max(
+            doc.times_derived, (existing_doc.times_derived or 1) + 1
+        )
         logger.warning(
             f"[DUPLICATE DETECTION] Deleting existing in favor of new. new='{doc.content}', existing='{existing_doc.content}'."
         )
@@ -1201,7 +1207,11 @@ async def is_rejected_duplicate(
         await db.flush()
         return False  # Don't reject the new document
 
-    # Existing document has more information, reject the new one
+    # Existing document has more information, reject the new one — but reinforce
+    # it first (R1): increment the survivor's derivation count instead of
+    # silently dropping the importance signal that this fact recurred.
+    existing_doc.times_derived = (existing_doc.times_derived or 1) + 1
+    await db.flush()
     logger.warning(
         f"[DUPLICATE DETECTION] Rejecting new in favor of existing. new='{doc.content}', existing='{existing_doc.content}'."
     )

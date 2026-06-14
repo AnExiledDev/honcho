@@ -1,4 +1,5 @@
 import datetime
+from unittest.mock import patch
 
 import pytest
 from nanoid import generate as generate_nanoid
@@ -7,6 +8,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, models, schemas
 from src.exceptions import ResourceNotFoundException
+
+
+class _FakeEncoding:
+    """Offline stand-in for tiktoken: word tokens drive is_rejected_duplicate's
+    set-difference scoring deterministically without an API key / network."""
+
+    def encode(self, s: str):
+        return s.split()
+
+
+class _FakeEmbeddingClient:
+    encoding = _FakeEncoding()
 
 
 class TestDocumentCRUD:
@@ -643,3 +656,136 @@ class TestDocumentCRUD:
             [make("first", e_a), make("second", e_a_near), make("first", e_a)], None
         )
         assert [d.content for d in disabled] == ["first", "second"]
+
+    @pytest.mark.asyncio
+    async def test_reinforcement_bumps_existing_when_new_rejected(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """R1: when write-time dedup REJECTS a redundant new derivation, the
+        surviving existing doc's times_derived is incremented (importance
+        accrues instead of the recurrence being silently dropped)."""
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+        emb = [0.0] * 1536
+        emb[0] = 1.0  # identical embedding -> cosine distance 0 -> detected as dup
+
+        def doc(content: str):
+            return schemas.DocumentCreate(
+                content=content,
+                embedding=list(emb),
+                session_name=test_session.name,
+                metadata=schemas.DocumentMetadata(
+                    message_ids=[1], message_created_at="2025-01-01T00:00:00Z"
+                ),
+            )
+
+        existing_content = "deploy prefers concise answers with examples first and clear visual separation"
+        await crud.create_documents(
+            db_session,
+            [doc(existing_content)],
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+        )
+        # New derivation is a strict subset (less info) -> existing is superior -> rejected
+        with patch("src.crud.document.embedding_client", _FakeEmbeddingClient()):
+            await crud.create_documents(
+                db_session,
+                [doc("deploy prefers concise answers")],
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=test_peer2.name,
+                deduplicate=True,
+            )
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(models.Document).where(
+                        models.Document.workspace_name == test_workspace.name,
+                        models.Document.deleted_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1, "redundant new doc must not be stored"
+        assert rows[0].content == existing_content
+        assert rows[0].times_derived == 2, "survivor must be reinforced (1 -> 2)"
+
+    @pytest.mark.asyncio
+    async def test_reinforcement_carries_count_when_new_supersedes(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """R1: when a superior new derivation SUPERSEDES an existing doc, it
+        inherits the running derivation count (existing.times_derived + 1)
+        rather than resetting to 1."""
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+        emb = [0.0] * 1536
+        emb[1] = 1.0
+
+        def doc(content: str):
+            return schemas.DocumentCreate(
+                content=content,
+                embedding=list(emb),
+                session_name=test_session.name,
+                metadata=schemas.DocumentMetadata(
+                    message_ids=[2], message_created_at="2025-01-01T00:00:00Z"
+                ),
+            )
+
+        # Seed an existing doc already reinforced to times_derived=3
+        existing = models.Document(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+            content="deploy likes pizza",
+            embedding=list(emb),
+            session_name=test_session.name,
+            times_derived=3,
+        )
+        db_session.add(existing)
+        await db_session.flush()
+
+        # Superior new derivation (more info) supersedes it
+        with patch("src.crud.document.embedding_client", _FakeEmbeddingClient()):
+            await crud.create_documents(
+                db_session,
+                [
+                    doc(
+                        "deploy likes pizza and pasta and salad with extra cheese on top"
+                    )
+                ],
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=test_peer2.name,
+                deduplicate=True,
+            )
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(models.Document).where(
+                        models.Document.workspace_name == test_workspace.name,
+                        models.Document.deleted_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1, "superseded existing doc must be soft-deleted"
+        assert rows[0].content.startswith("deploy likes pizza and pasta")
+        assert rows[0].times_derived == 4, (
+            "new doc must inherit existing count + 1 (3 -> 4)"
+        )
