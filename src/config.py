@@ -818,6 +818,14 @@ class DeriverSettings(HonchoSettings):
     # unaffected. See src.utils.noise_filter.is_operational_noise.
     FILTER_OPERATIONAL_NOISE: bool = True
 
+    # When enabled, drop derived CONCLUSIONS that are routine action/execution
+    # logs ("ran `cargo check`", "git commit <hash>", "edited foo.ts") before
+    # they are embedded and saved. These carry no durable signal about the peer
+    # and dilute retrieval. Conservative + subject-agnostic; a conclusion that
+    # also reads as a durable preference/standing-rule/attribute is never
+    # dropped. See src.utils.noise_filter.is_action_log_conclusion.
+    FILTER_ACTION_LOG_CONCLUSIONS: bool = True
+
     @model_validator(mode="before")
     @classmethod
     def _merge_model_config_defaults(cls, data: Any) -> Any:

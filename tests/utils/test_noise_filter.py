@@ -7,7 +7,7 @@ path, stat, or id. The NEGATIVE cases below are the load-bearing ones.
 
 import pytest
 
-from src.utils.noise_filter import is_operational_noise
+from src.utils.noise_filter import is_action_log_conclusion, is_operational_noise
 
 # Messages that ARE wholly operational noise -> should be filtered (True).
 NOISE_CASES = [
@@ -77,3 +77,55 @@ def test_operational_noise_is_filtered(content: str | None):
 @pytest.mark.parametrize("content", SUBSTANTIVE_CASES)
 def test_substantive_content_is_kept(content: str):
     assert is_operational_noise(content) is False
+
+
+# Derived CONCLUSIONS that are routine action/execution logs -> drop (True).
+ACTION_LOG_CASES = [
+    "On June 3, 2026 at 04:11:10, claude ran `cargo check` and it succeeded.",
+    "claude ran a full test suite of 339 tests, all green.",
+    "On June 7, 2026, deploy created a new Git commit with hash 196c381.",
+    "commit 6d1fa7f referenced a documentation-only change.",
+    "On May 26, 2026, deploy used the command '/improve-codebase-architecture'.",
+    "deploy issued the command '/honcho:status' at 17:39:42 UTC.",
+    "claude ran git add for web/src/stores/moderation-store.ts.",
+    "On June 7, 2026, deploy switched the git branch from feat/x to main.",
+    "claude executed the command `docker exec honcho-db psql -U honcho`.",
+    "claude edited mute-rule-repo.ts changing the select clause to insert.",
+]
+
+# Conclusions that are DURABLE facts and must survive (False) even though they
+# use action verbs or mention git/commands/filenames. These are the load-bearing
+# regression guards — dropping any of them is a real signal loss.
+DURABLE_CONCLUSION_CASES = [
+    # the two false positives caught during live precision tuning
+    "claude's global rule includes a caution about shared-checkout git status.",
+    "deploy wants agents.md treated as inside the server boundary.",
+    # core identity / preferences
+    "deploy has AuDHD and generally prefers bullet points for responses.",
+    "deploy's communication style is conversational but direct on important details.",
+    "deploy prefers concise, direct responses with clear visual separation.",
+    # standing rules / conventions (use action verbs but are durable)
+    "deploy created a standing rule that PRs must be green before merge.",
+    "deploy's standing rule: always inspect the token actor, not the base actor.",
+    "The convention is to keep the Issue Map in sync with every merged PR.",
+    # a bare git mention in prose, no execution frame
+    "git status shows the fixtures dir is dirty from a parallel session.",
+    "deploy dislikes losing signal to over-eager filters.",
+]
+
+
+@pytest.mark.parametrize("content", ACTION_LOG_CASES)
+def test_action_log_conclusion_is_filtered(content: str):
+    assert is_action_log_conclusion(content) is True
+
+
+@pytest.mark.parametrize("content", DURABLE_CONCLUSION_CASES)
+def test_durable_conclusion_is_kept(content: str):
+    assert is_action_log_conclusion(content) is False
+
+
+@pytest.mark.parametrize("content", ["", "   ", None])
+def test_action_log_empty_is_not_flagged(content: str | None):
+    # empty/None carries no action — not our concern (returns False, unlike the
+    # operational-noise classifier which treats empty as noise).
+    assert is_action_log_conclusion(content) is False

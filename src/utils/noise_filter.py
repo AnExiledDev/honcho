@@ -22,7 +22,7 @@ So this classifier only fires when the *entire* message is operational noise:
 
 import re
 
-__all__ = ["is_operational_noise"]
+__all__ = ["is_operational_noise", "is_action_log_conclusion"]
 
 # A leading bracketed harness/operational tag, e.g. "[Tool]", "[Tool Result]",
 # "[Git External]", "[Background Task: gilded-gauntlet]". The tag word(s) must
@@ -55,6 +55,66 @@ _HANDSHAKE_RE = re.compile(
     r"|begin\s+now\.?",
     re.IGNORECASE,
 )
+
+
+# An "action-log" CONCLUSION (distinct from is_operational_noise, which screens
+# input *messages*). The deriver sometimes records a routine, one-off
+# tool/command/test/git/file-edit *execution* as if it were a durable fact —
+# "claude ran `cargo check`", "deploy created commit 196c381", "edited foo.ts".
+# Those carry no lasting signal about the peer and dilute retrieval. This matches
+# the *shape* of such an event log, subject-agnostically (no hard-coded peer
+# names), so it generalizes across peers/workspaces.
+_ACTION_LOG_RE = re.compile(
+    # "<action verb> ... <command / test / git / docker / slash-command>"
+    r"\b(?:ran|re-?ran|executed|performed|issued|invoked)\b[^.]{0,40}"
+    r"(?:`|\bcommand\b|\bcommands\b|\bcargo\b|\bnpm\b|\bpnpm\b|\bbun\b|\bpytest\b"
+    r"|\bmake\b|\bgit\b|\bdocker\b|\bgh\b|\btests?\b|\btest suite\b|/[a-z][\w:-]*)"
+    # "<action verb> ... git <subcommand>" — verb required, so durable prose like
+    # "a rule about shared-checkout git status" never matches.
+    r"|\b(?:ran|re-?ran|executed|performed|issued|switched|made|did)\b[^.]{0,30}"
+    r"\bgit\s+(?:add|commit|push|pull|status|branch|checkout|switch|rebase|merge"
+    r"|stash|init|clone|fetch|reset|rev-parse|log|diff)\b"
+    # commit identified by hash
+    r"|\bcommit\s+(?:with\s+hash\s+|hash\s+)?[0-9a-f]{7,40}\b"
+    # explicit command/tool/script execution
+    r"|\b(?:executed|invoked)\s+(?:the\s+|a\s+)?(?:command|tool|script|macro|test"
+    r"|suite|hook)\b"
+    r"|\bused\s+the\s+(?:command|tool|slash[\s-]?command)\b"
+    # edited/created/etc. a concrete dotted filename
+    r"|\b(?:edited|modified|wrote|created|deleted|renamed|moved)\b[^.]{0,50}"
+    r"\b[\w./-]+\.[a-z]{1,6}\b",
+    re.IGNORECASE,
+)
+
+# A conclusion that reads as a durable preference / standing rule / stable
+# attribute is NEVER treated as an action-log, even if it uses an action verb
+# ("deploy created a standing rule that…"). Protects high-value signal.
+_DURABLE_GUARD_RE = re.compile(
+    r"\b(?:prefer|preference|standing rule|standing instruction|doctrine|always"
+    r"|never|AuDHD|communication style|wants?|instructed\s+(?:that|to)|requires?"
+    r"|global rule|rule\s+(?:is|for|about|includes?|that|stating|:)|convention"
+    r"|policy|values?|believes?|dislikes?|likes?|treated as)\b",
+    re.IGNORECASE,
+)
+
+
+def is_action_log_conclusion(content: str | None) -> bool:
+    """Return True if ``content`` is a routine action/execution log, not a fact.
+
+    Catches the deriver's occasional habit of recording one-off tool/command/
+    test/git/file-edit executions ("ran ``cargo check``", "git commit <hash>",
+    "edited foo.ts") as conclusions. Subject-agnostic, so it works for any peer.
+    A conclusion that also reads as a durable preference / standing rule / stable
+    attribute is never flagged, even when it uses an action verb.
+    """
+    if not content:
+        return False
+    text = content.strip()
+    if not text:
+        return False
+    if _DURABLE_GUARD_RE.search(text):
+        return False
+    return bool(_ACTION_LOG_RE.search(text))
 
 
 def is_operational_noise(content: str | None) -> bool:

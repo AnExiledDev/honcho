@@ -64,8 +64,9 @@ Analyze messages from {peer_id} to extract **explicit atomic facts** about them.
 RULES:
 - Properly attribute observations to the correct subject: if it is about {peer_id}, say so. If {peer_id} is referencing someone or something else, make that clear.
 - Observations should make sense on their own. Each observation will be used in the future to better understand {peer_id}.
-- Extract ALL observations from {peer_id} messages, using others as context.
+- Extract ALL durable observations from {peer_id} messages, using others as context.
 - Contextualize each observation sufficiently (e.g. "Ann is nervous about the job interview at the pharmacy" not just "Ann is nervous")
+- Do NOT record routine action/execution logs as facts: one-off tool/command/test/git/file-edit events (e.g. "ran cargo check", "git commit <hash>", "edited foo.ts", "used /some-command") are not durable and must be skipped. Capture only lasting preferences, decisions, knowledge, and stable attributes about {peer_id}.
 
 EXAMPLES:
 - EXPLICIT: "I just had my 25th birthday last Saturday" → "{peer_id} is 25 years old", "{peer_id}'s birthday is June 21st"

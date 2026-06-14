@@ -18,6 +18,7 @@ from src.schemas import ResolvedConfiguration
 from src.telemetry.events import EmbeddingCallPurpose
 from src.telemetry.logging import accumulate_metric
 from src.utils.formatting import format_datetime_utc
+from src.utils.noise_filter import is_action_log_conclusion
 from src.utils.representation import (
     DeductiveObservation,
     ExplicitObservation,
@@ -92,6 +93,24 @@ class RepresentationManager:
         if not all_observations:
             logger.debug("No non-empty observations to save")
             return new_documents
+
+        # Drop routine action/execution-log conclusions before embedding them
+        # ("ran `cargo check`", "git commit <hash>", "edited foo.ts"). They carry
+        # no durable signal and dilute retrieval; filtering here also avoids
+        # spending embedding tokens on them. Durable preferences/rules/attributes
+        # are guarded inside is_action_log_conclusion and never dropped.
+        if settings.DERIVER.FILTER_ACTION_LOG_CONCLUSIONS:
+            kept = [
+                obs
+                for obs in all_observations
+                if not is_action_log_conclusion(_observation_text(obs))
+            ]
+            dropped = len(all_observations) - len(kept)
+            if dropped:
+                logger.debug("Filtered %d action-log conclusion(s)", dropped)
+            all_observations = kept
+            if not all_observations:
+                return new_documents
 
         # Batch embed all observations
         batch_embed_start = time.perf_counter()
