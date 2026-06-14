@@ -401,3 +401,81 @@ class TestDocumentCRUD:
         assert len(documents) == 2
         assert documents[0].content in ["Observation 1", "Observation 2"]
         assert documents[1].content in ["Observation 1", "Observation 2"]
+
+    @pytest.mark.asyncio
+    async def test_hybrid_surfaces_exact_term_match(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Hybrid retrieval (cosine + FTS via RRF) surfaces an exact-term match
+        that pure cosine ranks out of the top_k, while leaving cosine-only
+        behavior intact when hybrid is disabled."""
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+
+        def vec(*idx_vals: tuple[int, float]) -> list[float]:
+            v = [0.0] * 1536
+            for i, val in idx_vals:
+                v[i] = val
+            return v
+
+        # Distinct-direction embeddings so cosine ordering is real (constant
+        # vectors would all be parallel -> distance 0). Query == doc_near.
+        query_emb = vec((0, 1.0))
+        emb_near = vec((0, 1.0))  # cosine dist 0 (closest)
+        emb_mid = vec((0, 1.0), (1, 1.0))  # cosine dist ~0.29
+        emb_far = vec((1, 1.0))  # cosine dist 1 (farthest) — but term match
+
+        content_near = "The user enjoys hiking on weekends"
+        content_mid = "Notes about cooking dinner"
+        content_far = "Project reliquary covers the Effigy epic"
+
+        def doc(content: str, embedding: list[float], mid: int):
+            return schemas.DocumentCreate(
+                content=content,
+                embedding=embedding,
+                session_name=test_session.name,
+                metadata=schemas.DocumentMetadata(
+                    message_ids=[mid],
+                    message_created_at="2025-01-01T00:00:00Z",
+                ),
+            )
+
+        await crud.create_documents(
+            db_session,
+            [
+                doc(content_near, emb_near, 1),
+                doc(content_mid, emb_mid, 2),
+                doc(content_far, emb_far, 3),
+            ],
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+        )
+
+        common = dict(
+            workspace_name=test_workspace.name,
+            query="reliquary effigy",  # exact terms only in content_far
+            observer=test_peer.name,
+            observed=test_peer2.name,
+            top_k=2,
+            embedding=query_emb,
+        )
+
+        # Pure cosine: the far doc is dropped from the top-2 entirely.
+        cosine_only = await crud.query_documents(db_session, **common, hybrid=False)
+        cosine_contents = [d.content for d in cosine_only]
+        assert content_far not in cosine_contents
+        assert set(cosine_contents) == {content_near, content_mid}
+
+        # Hybrid: the exact-term match is fused in (and RRF ranks the
+        # dual-signal doc first).
+        hybrid = await crud.query_documents(db_session, **common, hybrid=True)
+        hybrid_contents = [d.content for d in hybrid]
+        assert content_far in hybrid_contents, (
+            "hybrid retrieval must surface the exact-term match that cosine dropped"
+        )
+        assert hybrid[0].content == content_far

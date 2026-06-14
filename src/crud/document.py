@@ -1,9 +1,10 @@
 import datetime
+import re
 from collections.abc import Sequence
 from logging import getLogger
 from typing import Any, cast
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +24,7 @@ from src.exceptions import (
     VectorStoreError,
 )
 from src.utils.filter import apply_filter
+from src.utils.formatting import ILIKE_ESCAPE_CHAR, escape_ilike_pattern
 from src.vector_store import (
     VectorRecord,
     VectorStore,
@@ -279,6 +281,60 @@ async def fetch_documents_by_ids(
     return [documents[doc_id] for doc_id in document_ids if doc_id in documents]
 
 
+# Characters PostgreSQL FTS (plainto_tsquery) handles poorly; when the query
+# contains them we fall back to literal ILIKE matching, mirroring the message
+# search path in src/utils/search.py.
+_FTS_SPECIAL_CHARS_RE = re.compile(r'[~`!@#$%^&*()_+=\[\]{};\':"\\|,.<>/?-]')
+
+
+async def _fulltext_documents(
+    db: AsyncSession,
+    base_stmt: Select[tuple[models.Document]],
+    query: str,
+    limit: int,
+) -> list[models.Document]:
+    """Lexically rank documents for *query* over an already-scoped base
+    statement (workspace/observer/observed/filters/deleted_at applied).
+
+    Mirrors the message FTS path: ``to_tsvector``/``plainto_tsquery`` ranked by
+    ``ts_rank`` for natural-language queries, with an ILIKE fallback for queries
+    containing special characters (and as an OR fallback otherwise). Computed on
+    the fly — the documents table has no stored tsvector column, so a stored
+    tsvector + GIN index is a future scaling optimization.
+    """
+    escaped_query = escape_ilike_pattern(query)
+
+    if _FTS_SPECIAL_CHARS_RE.search(query):
+        fulltext_query = base_stmt.where(
+            models.Document.content.ilike(
+                f"%{escaped_query}%", escape=ILIKE_ESCAPE_CHAR
+            )
+        ).order_by(models.Document.created_at.desc())
+    else:
+        fts_condition = func.to_tsvector("english", models.Document.content).op("@@")(
+            func.plainto_tsquery("english", query)
+        )
+        combined_condition = or_(
+            fts_condition,
+            models.Document.content.ilike(
+                f"%{escaped_query}%", escape=ILIKE_ESCAPE_CHAR
+            ),
+        )
+        fulltext_query = base_stmt.where(combined_condition).order_by(
+            func.coalesce(
+                func.ts_rank(
+                    func.to_tsvector("english", models.Document.content),
+                    func.plainto_tsquery("english", query),
+                ),
+                0,
+            ).desc(),
+            models.Document.created_at.desc(),
+        )
+
+    result = await db.execute(fulltext_query.limit(limit))
+    return list(result.scalars().all())
+
+
 async def _query_documents_pgvector(
     db: AsyncSession,
     workspace_name: str,
@@ -288,29 +344,56 @@ async def _query_documents_pgvector(
     filters: dict[str, Any] | None,
     max_distance: float | None,
     top_k: int,
+    *,
+    query: str | None = None,
+    hybrid: bool = False,
 ) -> list[models.Document]:
-    """pgvector similarity search — pure DB operation."""
-    stmt = (
+    """pgvector similarity search — pure DB operation.
+
+    When *hybrid* is True and a non-empty *query* is supplied, the cosine
+    ranking is fused (Reciprocal Rank Fusion) with an on-the-fly full-text
+    ranking over the same scoped candidate pool, so exact-term/identifier
+    matches (issue numbers, project names) that pure cosine misses are
+    surfaced. *max_distance* gates only the vector arm — lexical matches are a
+    separate relevance axis (the dedup path keeps hybrid off, preserving its
+    strict cosine cutoff).
+    """
+    base_stmt = (
         select(models.Document)
         .where(models.Document.workspace_name == workspace_name)
         .where(models.Document.observer == observer)
         .where(models.Document.observed == observed)
-        .where(models.Document.embedding.isnot(None))
         .where(models.Document.deleted_at.is_(None))
     )
+    base_stmt = apply_filter(base_stmt, models.Document, filters)
 
+    use_hybrid = hybrid and bool(query and query.strip())
+    # Oversample each arm so the fusion has enough candidates to reorder.
+    candidate_limit = top_k * 2 if use_hybrid else top_k
+
+    vector_stmt = base_stmt.where(models.Document.embedding.isnot(None))
     if max_distance is not None:
-        stmt = stmt.where(
+        vector_stmt = vector_stmt.where(
             models.Document.embedding.cosine_distance(embedding) <= max_distance
         )
+    vector_stmt = vector_stmt.order_by(
+        models.Document.embedding.cosine_distance(embedding)
+    ).limit(candidate_limit)
 
-    stmt = apply_filter(stmt, models.Document, filters)
-    stmt = stmt.order_by(models.Document.embedding.cosine_distance(embedding)).limit(
-        top_k
+    vector_results = list((await db.execute(vector_stmt)).scalars().all())
+
+    if not use_hybrid:
+        return vector_results[:top_k]
+
+    fulltext_results = await _fulltext_documents(
+        db, base_stmt, cast(str, query), candidate_limit
     )
 
-    result = await db.execute(stmt)
-    return list(result.scalars().all())
+    # Same session -> SQLAlchemy's identity map returns the same Document
+    # instance for a row in both arms, so RRF fuses correctly on object identity.
+    from src.utils.search import reciprocal_rank_fusion
+
+    return reciprocal_rank_fusion(vector_results, fulltext_results, limit=top_k)
 
 
 async def query_documents(
@@ -324,6 +407,7 @@ async def query_documents(
     max_distance: float | None = None,
     top_k: int = 5,
     embedding: list[float] | None = None,
+    hybrid: bool | None = None,
 ) -> Sequence[models.Document]:
     """
     Query documents using semantic similarity.
@@ -342,10 +426,16 @@ async def query_documents(
         max_distance: Maximum cosine distance for results
         top_k: Number of results to return
         embedding: Optional pre-computed embedding for the query (avoids extra API call if possible)
+        hybrid: Fuse cosine with on-the-fly full-text ranking (RRF). None (default)
+            resolves to settings.HYBRID_CONCLUSION_SEARCH; the dedup path passes
+            False to keep strict cosine-only behavior. Only affects the pgvector
+            retrieval path.
 
     Returns:
         Sequence of matching documents
     """
+    resolved_hybrid = settings.HYBRID_CONCLUSION_SEARCH if hybrid is None else hybrid
+
     # Use provided embedding or generate one
     if embedding is None:
         try:
@@ -368,6 +458,8 @@ async def query_documents(
                 filters,
                 max_distance,
                 top_k,
+                query=query,
+                hybrid=resolved_hybrid,
             )
         async with tracked_db("query_documents.pgvector") as managed_db:
             docs = await _query_documents_pgvector(
@@ -379,6 +471,8 @@ async def query_documents(
                 filters,
                 max_distance,
                 top_k,
+                query=query,
+                hybrid=resolved_hybrid,
             )
             for doc in docs:
                 managed_db.expunge(doc)
@@ -982,7 +1076,9 @@ async def is_rejected_duplicate(
     If the document is a duplicate AND the new document is superior,
     deletes the existing document and returns False.
     """
-    # Step 1: Find potential duplicates using cosine similarity
+    # Step 1: Find potential duplicates using cosine similarity.
+    # hybrid=False: dedup must stay strict cosine (>=0.95) — lexical fusion
+    # could surface a term-similar but semantically-different doc as a "dup".
     similar_docs = await query_documents(
         db=db,
         workspace_name=workspace_name,
@@ -992,6 +1088,7 @@ async def is_rejected_duplicate(
         max_distance=0.05,
         top_k=1,
         embedding=doc.embedding,
+        hybrid=False,
     )
 
     if not similar_docs:

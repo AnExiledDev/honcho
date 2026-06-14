@@ -1309,6 +1309,14 @@ class AppSettings(HonchoSettings):
 
     MAX_MESSAGE_SIZE: Annotated[int, Field(default=25_000, gt=0)] = 25_000
     EMBED_MESSAGES: bool = True
+
+    # Hybrid conclusion/document retrieval: fuse cosine similarity with an
+    # on-the-fly full-text ranking via Reciprocal Rank Fusion, so exact
+    # term/identifier matches (issue numbers, project names) that pure vector
+    # search misses are surfaced. Applies to the pgvector retrieval path; the
+    # conclusion dedup path always stays pure-cosine. Set
+    # HYBRID_CONCLUSION_SEARCH=false to revert to cosine-only retrieval.
+    HYBRID_CONCLUSION_SEARCH: bool = True
     LANGFUSE_HOST: str | None = None
     LANGFUSE_PUBLIC_KEY: str | None = None
 
