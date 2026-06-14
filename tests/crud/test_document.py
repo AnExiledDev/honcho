@@ -539,3 +539,107 @@ class TestDocumentCRUD:
         assert results[0].content == doc_strong.content, (
             "the fresher, more-reinforced conclusion must rank first when relevance ties"
         )
+
+    @pytest.mark.asyncio
+    async def test_hybrid_dedup_collapses_exact_duplicate(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """A byte-identical conclusion stored twice must not consume two of the
+        top_k slots — retrieval-time dedup collapses it to one and a distinct
+        conclusion fills the freed slot. (Guards the proven duplicate-surfacing
+        regression.)"""
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+
+        def vec(*idx_vals: tuple[int, float]) -> list[float]:
+            v = [0.0] * 1536
+            for i, val in idx_vals:
+                v[i] = val
+            return v
+
+        query_emb = vec((0, 1.0))
+        emb_dup = vec((0, 1.0))  # both duplicates: cosine dist 0 (closest)
+        emb_distinct = vec((0, 1.0), (1, 0.25))  # slightly off -> ranks third
+
+        dup_content = "The Night Crew campaign"
+        distinct_content = "Project reliquary indexes Foundry packages"
+
+        def doc(content: str, embedding: list[float], mid: int):
+            return schemas.DocumentCreate(
+                content=content,
+                embedding=embedding,
+                session_name=test_session.name,
+                metadata=schemas.DocumentMetadata(
+                    message_ids=[mid],
+                    message_created_at="2025-01-01T00:00:00Z",
+                ),
+            )
+
+        await crud.create_documents(
+            db_session,
+            [
+                doc(dup_content, emb_dup, 1),
+                doc(dup_content, emb_dup, 2),  # exact duplicate
+                doc(distinct_content, emb_distinct, 3),
+            ],
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+        )
+
+        common = dict(
+            workspace_name=test_workspace.name,
+            query="unrelated terms",  # no full-text arm
+            observer=test_peer.name,
+            observed=test_peer2.name,
+            top_k=2,
+            embedding=query_emb,
+        )
+
+        hybrid = await crud.query_documents(db_session, **common, hybrid=True)
+        contents = [d.content for d in hybrid]
+        assert contents.count(dup_content) == 1, (
+            "exact-duplicate conclusion must be collapsed to a single slot"
+        )
+        assert distinct_content in contents, (
+            "the slot freed by dedup must be filled by a distinct conclusion"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dedup_documents_threshold_behavior(self):
+        """Pure-function check of _dedup_documents: byte-identical always
+        collapses; near-duplicate embeddings collapse only at/above the cosine
+        threshold; distinct embeddings are preserved; threshold None disables
+        embedding dedup (exact-content only — the default)."""
+        from src.crud.document import _dedup_documents
+
+        def make(content: str, embedding: list[float] | None) -> models.Document:
+            return models.Document(content=content, embedding=embedding)
+
+        e_a = [1.0, 0.0, 0.0]
+        e_a_near = [0.99, 0.01, 0.0]  # cosine ~0.9999 vs e_a
+        e_b = [0.0, 1.0, 0.0]  # orthogonal -> cosine 0
+
+        # Exact-content collapse regardless of embedding.
+        exact = _dedup_documents(
+            [make("same", e_a), make("same", e_b), make("other", e_b)], 0.97
+        )
+        assert [d.content for d in exact] == ["same", "other"]
+
+        # Near-duplicate embeddings (cosine ~0.9999 >= 0.97) collapse even with
+        # different content; the orthogonal one survives.
+        near = _dedup_documents(
+            [make("first", e_a), make("second", e_a_near), make("third", e_b)], 0.97
+        )
+        assert [d.content for d in near] == ["first", "third"]
+
+        # Threshold None (the default) disables embedding dedup: near-duplicate
+        # survives, only byte-identical content collapses.
+        disabled = _dedup_documents(
+            [make("first", e_a), make("second", e_a_near), make("first", e_a)], None
+        )
+        assert [d.content for d in disabled] == ["first", "second"]

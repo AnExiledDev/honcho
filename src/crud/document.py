@@ -1,4 +1,5 @@
 import datetime
+import math
 import re
 from collections.abc import Sequence
 from logging import getLogger
@@ -359,10 +360,13 @@ async def _query_documents_pgvector(
       * reinforcement (times_derived desc) — favors repeatedly-derived facts.
     RRF combines them with no weight tuning, and because the recency/
     reinforcement arms rank only the existing relevance pool they reorder
-    without introducing irrelevant docs or dropping any (no retrieval-time
-    dedup — write-time dedup at >=0.95 already prevents near-identical
-    storage, and a looser retrieval threshold would risk discarding distinct
-    nuances). *max_distance* gates only the vector arm — lexical matches are a
+    without introducing irrelevant docs. The fused list is then passed through
+    a conservative retrieval-time dedup (``_dedup_documents``): byte-identical
+    conclusions are always collapsed so an exact repeat can't consume two of
+    the *top_k* slots even when write-time dedup let it through. Embedding-based
+    near-duplicate dedup is opt-in (``CONCLUSION_DEDUP_COSINE``, off by default)
+    because distinct-but-related facts can sit above any practical similarity
+    threshold. *max_distance* gates only the vector arm — lexical matches are a
     separate relevance axis (the dedup path keeps hybrid off, preserving its
     strict cosine cutoff).
     """
@@ -414,13 +418,67 @@ async def _query_documents_pgvector(
     # instance for a row across arms, so RRF fuses correctly on object identity.
     from src.utils.search import reciprocal_rank_fusion
 
-    return reciprocal_rank_fusion(
+    # Fuse the whole relevance pool (not just top_k) so retrieval-time dedup has
+    # headroom to drop near-duplicates and still fill top_k with distinct facts.
+    fused = reciprocal_rank_fusion(
         vector_results,
         fulltext_results,
         recency_arm,
         reinforcement_arm,
-        limit=top_k,
+        limit=len(candidate_pool),
     )
+    return _dedup_documents(fused, settings.CONCLUSION_DEDUP_COSINE)[:top_k]
+
+
+def _cosine_sim(a: Sequence[float], b: Sequence[float]) -> float:
+    """Cosine similarity of two equal-length float vectors (0.0 if degenerate)."""
+    dot = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+    for x, y in zip(a, b, strict=False):
+        dot += x * y
+        norm_a += x * x
+        norm_b += y * y
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+
+
+def _dedup_documents(
+    docs: list[models.Document], cosine_threshold: float | None
+) -> list[models.Document]:
+    """Collapse duplicate conclusions in an already-ranked result list.
+
+    Keeps the first (highest-ranked) instance and drops any later one that is
+    **byte-identical** in content — pure repetition that should never occupy
+    two slots. Optional embedding-based near-duplicate dedup is OFF unless
+    *cosine_threshold* is not None: then a later result is also dropped when its
+    embedding cosine-similarity to an already-kept document meets/exceeds the
+    threshold. Embedding dedup is opt-in because distinct-but-related
+    conclusions can sit above any practical threshold, so collapsing on
+    similarity risks discarding genuine nuance.
+    """
+    kept: list[models.Document] = []
+    seen_content: set[str] = set()
+    use_embedding = cosine_threshold is not None
+    for d in docs:
+        content = (d.content or "").strip()
+        if content and content in seen_content:
+            continue
+        if (
+            use_embedding
+            and d.embedding is not None
+            and any(
+                k.embedding is not None
+                and _cosine_sim(d.embedding, k.embedding) >= cosine_threshold
+                for k in kept
+            )
+        ):
+            continue
+        kept.append(d)
+        if content:
+            seen_content.add(content)
+    return kept
 
 
 async def query_documents(

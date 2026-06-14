@@ -1317,6 +1317,18 @@ class AppSettings(HonchoSettings):
     # conclusion dedup path always stays pure-cosine. Set
     # HYBRID_CONCLUSION_SEARCH=false to revert to cosine-only retrieval.
     HYBRID_CONCLUSION_SEARCH: bool = True
+
+    # Retrieval-time dedup of conclusions on the hybrid path. Byte-identical
+    # conclusions are ALWAYS collapsed (pure repetition — fixes the observed
+    # case of one fact occupying two top_k slots). Optional embedding-based
+    # near-duplicate dedup is OFF by default (None): set this to a cosine
+    # threshold (e.g. 0.97) to also drop a fused result whose embedding
+    # cosine-similarity to an already-kept, higher-ranked result meets/exceeds
+    # it. Left off by default because distinct-but-related conclusions can sit
+    # well above any practical threshold, so embedding dedup risks discarding
+    # genuine nuance; opt in deliberately. Only affects the hybrid path; the
+    # write-time dedup path stays pure-cosine and is unaffected.
+    CONCLUSION_DEDUP_COSINE: float | None = None
     LANGFUSE_HOST: str | None = None
     LANGFUSE_PUBLIC_KEY: str | None = None
 
