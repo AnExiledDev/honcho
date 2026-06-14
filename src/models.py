@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Computed,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -20,7 +21,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TEXT
+from sqlalchemy.dialects.postgresql import JSONB, TEXT, TSVECTOR
 from sqlalchemy.orm import Mapped, MappedColumn, mapped_column, relationship
 from sqlalchemy.sql import func
 from typing_extensions import override
@@ -383,6 +384,16 @@ class Document(Base):
         "internal_metadata", JSONB, default=dict, server_default=text("'{}'::jsonb")
     )
     content: Mapped[str] = mapped_column(TEXT)
+    # R2: STORED generated full-text vector + GIN index (see __table_args__).
+    # Eliminates per-query to_tsvector(content) recomputation on the FTS arm
+    # (measured ~286ms over a ~4.7k-row collection -> single-digit ms).
+    # deferred: used only in SQL WHERE/ORDER BY, never loaded onto the object.
+    content_tsv: Mapped[Any] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', content)", persisted=True),
+        nullable=True,
+        deferred=True,
+    )
     level: Mapped[DocumentLevel] = mapped_column(
         TEXT, nullable=False, server_default="explicit"
     )
@@ -462,6 +473,12 @@ class Document(Base):
         Index(
             "ix_documents_source_ids_gin",
             "source_ids",
+            postgresql_using="gin",
+        ),
+        # R2: GIN index on the stored full-text vector for the hybrid FTS arm.
+        Index(
+            "ix_documents_content_tsv",
+            "content_tsv",
             postgresql_using="gin",
         ),
         # Composite index for efficient reconciliation queries

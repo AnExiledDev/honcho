@@ -297,11 +297,13 @@ async def _fulltext_documents(
     """Lexically rank documents for *query* over an already-scoped base
     statement (workspace/observer/observed/filters/deleted_at applied).
 
-    Mirrors the message FTS path: ``to_tsvector``/``plainto_tsquery`` ranked by
-    ``ts_rank`` for natural-language queries, with an ILIKE fallback for queries
-    containing special characters (and as an OR fallback otherwise). Computed on
-    the fly — the documents table has no stored tsvector column, so a stored
-    tsvector + GIN index is a future scaling optimization.
+    Mirrors the message FTS path: ``plainto_tsquery`` ranked by ``ts_rank`` for
+    natural-language queries, with an ILIKE fallback for queries containing
+    special characters (and as an OR fallback otherwise). Reads the STORED,
+    GIN-indexed ``content_tsv`` column (R2) instead of recomputing
+    ``to_tsvector(content)`` per row — the recompute dominated FTS latency
+    (~286ms over a ~4.7k-row collection); the stored vector makes it single-
+    digit ms and the GIN index keeps it bounded as the corpus grows.
     """
     escaped_query = escape_ilike_pattern(query)
 
@@ -312,9 +314,8 @@ async def _fulltext_documents(
             )
         ).order_by(models.Document.created_at.desc())
     else:
-        fts_condition = func.to_tsvector("english", models.Document.content).op("@@")(
-            func.plainto_tsquery("english", query)
-        )
+        tsquery = func.plainto_tsquery("english", query)
+        fts_condition = models.Document.content_tsv.op("@@")(tsquery)
         combined_condition = or_(
             fts_condition,
             models.Document.content.ilike(
@@ -323,10 +324,7 @@ async def _fulltext_documents(
         )
         fulltext_query = base_stmt.where(combined_condition).order_by(
             func.coalesce(
-                func.ts_rank(
-                    func.to_tsvector("english", models.Document.content),
-                    func.plainto_tsquery("english", query),
-                ),
+                func.ts_rank(models.Document.content_tsv, tsquery),
                 0,
             ).desc(),
             models.Document.created_at.desc(),
